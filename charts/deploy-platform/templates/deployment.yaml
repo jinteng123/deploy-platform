@@ -1,0 +1,169 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount must be 1 — the in-memory store and task queue cannot run multi-replica" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deploy-platform.fullname" . }}
+  labels: {{ include "deploy-platform.labels" . | nindent 4 }}
+spec:
+  # 单副本约束：Store 与任务队列均为进程内存实现，多副本会重复执行
+  # 发布任务并分裂会话/审计状态。分布式改造完成前必须为 1 —— 模板顶部
+  # 的 fail 断言把这条约束变成硬失败而非文档约定。
+  replicas: {{ int .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{ include "deploy-platform.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{ include "deploy-platform.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "deploy-platform.serviceAccountName" . }}
+      securityContext: {{ toYaml .Values.securityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: server
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext: {{ toYaml .Values.containerSecurityContext | nindent 10 }}
+        ports:
+        - name: http
+          containerPort: 8000
+        # ENV/MOCK_RUNTIME/HTTP_ADDR/TRANSFER_DIR 与 Dockerfile 的镜像级
+        # ENV 默认是一组重复真相——chart 显式渲染是 k8s 部署的唯一真相源，
+        # 镜像默认只服务裸 docker 场景，改值需两边同步。
+        env:
+        - name: ENV
+          value: "production"
+        - name: MOCK_RUNTIME
+          value: {{ .Values.env.MOCK_RUNTIME | quote }}
+        - name: PROMOTION_APPROVAL
+          value: "true"
+        - name: DRIFT_POLL_INTERVAL_SECONDS
+          value: {{ .Values.env.DRIFT_POLL_INTERVAL_SECONDS | quote }}
+        {{- if .Values.env.PLATFORM_PUBLIC_URL }}
+        - name: PLATFORM_PUBLIC_URL
+          value: {{ .Values.env.PLATFORM_PUBLIC_URL | quote }}
+        {{- end }}
+        {{- if .Values.env.NOTIFICATION_WEBHOOK_URL }}
+        - name: NOTIFICATION_WEBHOOK_URL
+          value: {{ .Values.env.NOTIFICATION_WEBHOOK_URL | quote }}
+        - name: NOTIFICATION_WEBHOOK_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "secrets.notificationWebhookSecret.secretName is required when notifications are enabled" .Values.secrets.notificationWebhookSecret.secretName }}
+              key: {{ .Values.secrets.notificationWebhookSecret.key }}
+        {{- if .Values.notificationWebhookCA.configMapName }}
+        - name: NOTIFICATION_WEBHOOK_CA_FILE
+          value: "/etc/deploy-platform/notification-ca/ca.crt"
+        {{- end }}
+        {{- end }}
+        - name: HTTP_ADDR
+          value: ":8000"
+        - name: TRANSFER_DIR
+          value: "/data/transfer_space"
+        - name: MYSQL_HOST
+          value: {{ required "mysql.host is required" .Values.mysql.host | quote }}
+        - name: MYSQL_PORT
+          value: {{ .Values.mysql.port | quote }}
+        - name: MYSQL_DATABASE
+          value: {{ .Values.mysql.database | quote }}
+        - name: MYSQL_USER
+          value: {{ .Values.mysql.user | quote }}
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "mysql.existingSecret.name is required" .Values.mysql.existingSecret.name }}
+              key: {{ .Values.mysql.existingSecret.passwordKey }}
+        # DSN 由分段 env 拼装——Secret 里只存密码本身，不存整串 DSN。
+        - name: DATABASE_DSN
+          value: "$(MYSQL_USER):$(MYSQL_PASSWORD)@tcp($(MYSQL_HOST):$(MYSQL_PORT))/$(MYSQL_DATABASE)?parseTime=true&charset=utf8mb4"
+        - name: CREDENTIAL_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "secrets.credentialEncryptionKey.secretName is required" .Values.secrets.credentialEncryptionKey.secretName }}
+              key: {{ .Values.secrets.credentialEncryptionKey.key }}
+        {{- if .Values.secrets.yunxiaoWebhookToken.secretName }}
+        - name: YUNXIAO_WEBHOOK_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.yunxiaoWebhookToken.secretName }}
+              key: {{ .Values.secrets.yunxiaoWebhookToken.key }}
+        {{- end }}
+        {{- if .Values.secrets.adminInitialPassword.secretName }}
+        - name: ADMIN_INITIAL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.adminInitialPassword.secretName }}
+              key: {{ .Values.secrets.adminInitialPassword.key }}
+        {{- end }}
+        {{- if .Values.env.REGISTRY_HOST }}
+        - name: REGISTRY_HOST
+          value: {{ .Values.env.REGISTRY_HOST | quote }}
+        - name: REGISTRY_PROJECT
+          value: {{ .Values.env.REGISTRY_PROJECT | quote }}
+        - name: REGISTRY_USER
+          value: {{ .Values.env.REGISTRY_USER | quote }}
+        {{- if .Values.env.REGISTRY_AUTH_HOSTS }}
+        - name: REGISTRY_AUTH_HOSTS
+          value: {{ .Values.env.REGISTRY_AUTH_HOSTS | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.secrets.registryPassword.secretName }}
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.registryPassword.secretName }}
+              key: {{ .Values.secrets.registryPassword.key }}
+        {{- end }}
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources: {{ toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+        - name: transfer
+          mountPath: /data/transfer_space
+        - name: tmp
+          mountPath: /tmp
+        {{- if and .Values.env.NOTIFICATION_WEBHOOK_URL .Values.notificationWebhookCA.configMapName }}
+        - name: notification-webhook-ca
+          mountPath: /etc/deploy-platform/notification-ca
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: transfer
+        emptyDir:
+          sizeLimit: {{ .Values.transferDir.sizeLimit }}
+      - name: tmp
+        emptyDir: {}
+      {{- if and .Values.env.NOTIFICATION_WEBHOOK_URL .Values.notificationWebhookCA.configMapName }}
+      - name: notification-webhook-ca
+        configMap:
+          name: {{ .Values.notificationWebhookCA.configMapName | quote }}
+          items:
+          - key: {{ .Values.notificationWebhookCA.key | quote }}
+            path: ca.crt
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}

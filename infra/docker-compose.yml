@@ -1,0 +1,64 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: deploy-platform-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: deploy-platform
+      MYSQL_DATABASE: deploy_platform
+      MYSQL_USER: deploy
+      MYSQL_PASSWORD: deploy-platform
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - deploy-platform-mysql:/var/lib/mysql
+      - ../backend-go/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ../backend-go/seed_apps.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+      - ./mysql/03-local-cluster.sql:/docker-entrypoint-initdb.d/03-local-cluster.sql:ro
+      - ../backend-go/migrations/001_image_releases.sql:/docker-entrypoint-initdb.d/10-001_image_releases.sql:ro
+      - ../backend-go/migrations/002_cluster_connections.sql:/docker-entrypoint-initdb.d/10-002_cluster_connections.sql:ro
+      - ../backend-go/migrations/003_users_audit.sql:/docker-entrypoint-initdb.d/10-003_users_audit.sql:ro
+      - ../backend-go/migrations/004_api_keys.sql:/docker-entrypoint-initdb.d/10-004_api_keys.sql:ro
+      - ../backend-go/migrations/005_promotion_requests.sql:/docker-entrypoint-initdb.d/10-005_promotion_requests.sql:ro
+      - ../backend-go/migrations/006_release_safety.sql:/docker-entrypoint-initdb.d/10-006_release_safety.sql:ro
+      - ../backend-go/migrations/007_delivery_notifications.sql:/docker-entrypoint-initdb.d/10-007_delivery_notifications.sql:ro
+      - ../backend-go/migrations/008_component_bindings.sql:/docker-entrypoint-initdb.d/10-008_component_bindings.sql:ro
+      - ../backend-go/migrations/009_runner_integrations.sql:/docker-entrypoint-initdb.d/10-009_runner_integrations.sql:ro
+      - ../backend-go/migrations/010_delivery_model.sql:/docker-entrypoint-initdb.d/10-010_delivery_model.sql:ro
+      - ../backend-go/migrations/011_delivery_plans.sql:/docker-entrypoint-initdb.d/10-011_delivery_plans.sql:ro
+      - ../backend-go/migrations/012_plan_approval_link.sql:/docker-entrypoint-initdb.d/10-012_plan_approval_link.sql:ro
+      - ../backend-go/migrations/013_delivery_resource_locks.sql:/docker-entrypoint-initdb.d/10-013_delivery_resource_locks.sql:ro
+      - ../backend-go/migrations/014_delivery_execution_actions.sql:/docker-entrypoint-initdb.d/10-014_delivery_execution_actions.sql:ro
+      - ../backend-go/migrations/015_delivery_blue_green_entry.sql:/docker-entrypoint-initdb.d/10-015_delivery_blue_green_entry.sql:ro
+      - ../backend-go/migrations/016_delivery_runs.sql:/docker-entrypoint-initdb.d/10-016_delivery_runs.sql:ro
+      - ../backend-go/migrations/017_delivery_resource_lock_leases.sql:/docker-entrypoint-initdb.d/10-017_delivery_resource_lock_leases.sql:ro
+      - ../backend-go/migrations/018_delivery_workload_references.sql:/docker-entrypoint-initdb.d/10-018_delivery_workload_references.sql:ro
+      - ../backend-go/migrations/019_delivery_policy_versions.sql:/docker-entrypoint-initdb.d/10-019_delivery_policy_versions.sql:ro
+      - ../backend-go/migrations/020_delivery_drift_observations.sql:/docker-entrypoint-initdb.d/10-020_delivery_drift_observations.sql:ro
+      - ../backend-go/migrations/021_deploy_environment_tier_snapshot.sql:/docker-entrypoint-initdb.d/10-021_deploy_environment_tier_snapshot.sql:ro
+      - ../backend-go/migrations/022_delivery_canary_policy.sql:/docker-entrypoint-initdb.d/10-022_delivery_canary_policy.sql:ro
+      - ../backend-go/migrations/023_delivery_environment_evidence_policy.sql:/docker-entrypoint-initdb.d/10-023_delivery_environment_evidence_policy.sql:ro
+      - ../backend-go/migrations/024_delivery_run_event_payloads.sql:/docker-entrypoint-initdb.d/10-024_delivery_run_event_payloads.sql:ro
+      - ../backend-go/migrations/025_worker_claim_ownership.sql:/docker-entrypoint-initdb.d/10-025_worker_claim_ownership.sql:ro
+      - ../backend-go/migrations/026_delivery_notification_alert_index.sql:/docker-entrypoint-initdb.d/10-026_delivery_notification_alert_index.sql:ro
+      - ../backend-go/migrations/027_delivery_notification_due_order.sql:/docker-entrypoint-initdb.d/10-027_delivery_notification_due_order.sql:ro
+      - ../backend-go/migrations/028_delivery_incident_events.sql:/docker-entrypoint-initdb.d/10-028_delivery_incident_events.sql:ro
+      - ../backend-go/migrations/029_component_deployment_config_source.sql:/docker-entrypoint-initdb.d/10-029_component_deployment_config_source.sql:ro
+      - ../backend-go/migrations/030_delivery_incident_intervention.sql:/docker-entrypoint-initdb.d/10-030_delivery_incident_intervention.sql:ro
+      - ../backend-go/migrations/031_delivery_approval_grants.sql:/docker-entrypoint-initdb.d/10-031_delivery_approval_grants.sql:ro
+      - ../backend-go/migrations/032_delivery_pipeline_binding.sql:/docker-entrypoint-initdb.d/10-032_delivery_pipeline_binding.sql:ro
+      - ../backend-go/migrations/033_persistent_user_sessions.sql:/docker-entrypoint-initdb.d/10-033_persistent_user_sessions.sql:ro
+      - ../backend-go/migrations/034_pending_deploy_log_scan_index.sql:/docker-entrypoint-initdb.d/10-034_pending_deploy_log_scan_index.sql:ro
+      - ../backend-go/migrations/035_delivery_pipeline_scope_reviews.sql:/docker-entrypoint-initdb.d/10-035_delivery_pipeline_scope_reviews.sql:ro
+      - ../backend-go/migrations/036_delivery_incident_causality.sql:/docker-entrypoint-initdb.d/10-036_delivery_incident_causality.sql:ro
+      - ../backend-go/migrations/037_delivery_incident_remediation.sql:/docker-entrypoint-initdb.d/10-037_delivery_incident_remediation.sql:ro
+      - ../backend-go/migrations/038_repair_legacy_environment_name.sql:/docker-entrypoint-initdb.d/10-038_repair_legacy_environment_name.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-udeploy", "-pdeploy-platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  deploy-platform-mysql:

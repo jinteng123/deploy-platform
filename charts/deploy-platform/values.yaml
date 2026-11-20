@@ -1,0 +1,117 @@
+# Deploy Platform Helm values
+#
+# 单副本约束：内存 Store + 进程内任务队列未完成分布式改造前，
+# replicaCount 必须保持 1 —— 多副本会导致任务重复执行与状态分裂。
+replicaCount: 1
+
+image:
+  repository: deploy-platform
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+
+# RBAC 分级（最小权限，绝不默认 cluster-admin）：
+#   read  —— 只读 ClusterRole：get/list/watch，覆盖控制台资源集
+#            （不含 secrets —— 需要查看 Secret 时显式加入 rules）。
+#   write —— 在 read 基础上附加写 ClusterRole：deployments/statefulsets/
+#            daemonsets/configmaps/services/pvc 的 update/patch/delete、
+#            pods delete、pods/exec create、pods/log get。
+#            exec 需要 pods/exec create + pods/log get；写操作需要
+#            对应资源的 update/patch/delete。默认关闭。
+rbac:
+  create: true
+  read: true
+  write: false
+
+env:
+  MOCK_RUNTIME: "false"
+  # 后台镜像漂移观测间隔（秒）：0 关闭；启用范围 60–86400。
+  DRIFT_POLL_INTERVAL_SECONDS: "0"
+  NOTIFICATION_WEBHOOK_URL: ""
+  PLATFORM_PUBLIC_URL: ""
+  REGISTRY_HOST: ""
+  REGISTRY_PROJECT: ""
+  REGISTRY_USER: ""
+  REGISTRY_AUTH_HOSTS: ""
+
+# 可选内部 webhook TLS CA：PEM bundle 由 ConfigMap 提供，证书校验仍开启。
+notificationWebhookCA:
+  configMapName: ""
+  key: ca.crt
+
+# 外部 MySQL（不进 Chart）：host/user/database 为普通值，
+# 密码只从已有 Secret 读。
+mysql:
+  host: ""
+  port: 3306
+  database: deploy_platform
+  user: deploy
+  existingSecret:
+    name: ""
+    passwordKey: password
+
+# 凭据密钥：全部由外部 Secret 挂载，values 里永不写明文。
+secrets:
+  credentialEncryptionKey:
+    secretName: ""
+    key: credential-encryption-key
+  yunxiaoWebhookToken:
+    secretName: ""
+    key: webhook-token
+  adminInitialPassword:
+    # Real runtime requires this Secret for the first administrator.
+    secretName: ""
+    key: admin-initial-password
+  notificationWebhookSecret:
+    secretName: ""
+    key: notification-webhook-secret
+  registryPassword:
+    secretName: ""
+    key: registry-password
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  #  - host: deploy-platform.example.com
+  #    paths: [{path: /, pathType: Prefix}]
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# 文件发布中转目录：进程级工作空间，emptyDir 即可（禁 hostPath）。
+transferDir:
+  sizeLimit: 2Gi
+
+# uid/gid 10001 与 Dockerfile 里的 `adduser -D -u 10001 app` 对应——
+# 改镜像用户必须同步这里。
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

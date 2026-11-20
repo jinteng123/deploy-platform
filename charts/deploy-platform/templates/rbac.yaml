@@ -1,0 +1,89 @@
+{{- if .Values.rbac.create }}
+# 只读层：控制台浏览/概览/日志所需的最小集合。
+# 刻意不含 secrets —— Secret 显式查看属于高敏感读，默认不授予；
+# 需要时把 secrets 加进规则或开启 write 层。
+{{- if .Values.rbac.read }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "deploy-platform.fullname" . }}-read
+  labels: {{ include "deploy-platform.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "services", "configmaps", "namespaces", "nodes", "persistentvolumeclaims", "persistentvolumes", "events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "deploy-platform.fullname" . }}-read
+  labels: {{ include "deploy-platform.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "deploy-platform.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "deploy-platform.fullname" . }}-read
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- if .Values.rbac.write }}
+---
+# 写入层（显式开启才绑定）：受控写、YAML 编辑、删除、终端 exec、
+# Secret 显式查看。apiserver RBAC 是最终执行点——此层只决定
+# 平台 SA 对宿集群的权限面；其他集群由各自 kubeconfig 凭据决定。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "deploy-platform.fullname" . }}-write
+  labels: {{ include "deploy-platform.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "persistentvolumeclaims"]
+  verbs: ["update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["update", "patch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "deploy-platform.fullname" . }}-write
+  labels: {{ include "deploy-platform.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "deploy-platform.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "deploy-platform.fullname" . }}-write
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

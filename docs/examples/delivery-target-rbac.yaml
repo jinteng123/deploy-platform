@@ -1,0 +1,62 @@
+# Apply once per target namespace in each target cluster.
+# Replace the RoleBinding subject with the API Server identity used by the
+# cluster credential registered in Deploy Platform. This is not the platform
+# Pod's ServiceAccount unless that exact ServiceAccount is the target credential.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-platform-delivery
+  namespace: replace-with-target-namespace
+rules:
+  # Rolling updates use Deployment Update + rollout polling. Blue-green also
+  # creates/removes candidate Deployments and patches stable template labels.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Candidate-isolation checks and post-rollout Pod imageID observations read ReplicaSets.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+  # Blue-green creates a preview Service, switches the bound entry selector,
+  # and removes only the preview Service it journaled as its own.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  # Readiness/traffic-endpoint checks and optional post-rollout imageID observations read Pods.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+  # Read-only rollout preflight checks.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["list"]
+  # Needed only when the target Pod template leaves imagePullSecrets empty.
+  # The plan reads this ServiceAccount's metadata for inherited Secret names;
+  # it never reads Secret data.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    resourceNames: ["replace-with-workload-service-account"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-platform-delivery
+  namespace: replace-with-target-namespace
+subjects:
+  # For a kubeconfig/token user, bind the username or group authenticated by
+  # the API Server. For a ServiceAccount, use kind ServiceAccount and set its
+  # namespace and name to the identity embedded in the registered credential.
+  - kind: User
+    name: replace-with-target-execution-username
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: deploy-platform-delivery
+  apiGroup: rbac.authorization.k8s.io

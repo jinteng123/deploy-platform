@@ -1,0 +1,696 @@
+openapi: 3.0.3
+info:
+  title: Deploy Platform OpenAPI
+  version: "1.3.0"
+  description: |
+    对外开放的 CI/CD 接口：查询发布单/部署日志、晋级生产、回滚。
+    通用接口使用「设置 → API 密钥」创建的 dp_ 密钥。
+    /runner 路径使用组件接入引导生成的 dpci_ 专属密钥，两者不通用。
+    密钥明文只在创建/轮换时返回一次。
+
+    - 鉴权：`Authorization: Bearer dp_xxx` 或 `X-Api-Key: dp_xxx`
+    - 角色：viewer = 只读；operator = 可触发晋级/回滚
+    - 机器身份可以申请生产发布、提交 CI 验证/扫描报告；禁止作为独立审批人
+    - 回滚仅接受历史成功且固化镜像的 target_log_id；不恢复配置或数据库
+    - 审计：所有写操作以 `apikey:<name>` 记入操作审计
+    - 错误：`{"error": "消息"}`；幂等由业务字段保证（webhook event_key /
+      晋级同集群 409 冲突拒绝）
+servers:
+  - url: /openapi/v1
+security:
+  - ApiKeyAuth: []
+paths:
+  /releases:
+    get:
+      summary: 发布单列表（新→旧）
+      parameters:
+        - { name: app_name, in: query, schema: { type: string }, description: 按应用过滤 }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200":
+          description: 发布单视图数组（含测试/生产部署状态）
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ImageReleaseView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /releases/{id}:
+    get:
+      summary: 单个发布单
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: 发布单视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageReleaseView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /releases/{id}/verification:
+    post:
+      summary: 提交同制品的独立业务验证（operator 密钥）
+      description: >-
+        kind 取 [ci, smoke]，禁止机器提交人工验收。digest 必须与制品完全一致，
+        有效期必须晚于当前时间且不超过 7 天；来源与记录时间由服务器写入。
+        每次新报告会追加到验证历史，完全相同的重试不会重复记录或延长有效期；
+        verification 返回最新记录，同时 metadata.verification_history 保留历史。
+        扫描缺失/过期不显示为通过，当前扫描报告不阻断发布。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerificationEvidence" }
+      responses:
+        "200":
+          description: 最新制品元数据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseMetadata" }
+        "400": { description: digest、类型、状态、有效期或报告 URL 非法 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /releases/{id}/scan:
+    post:
+      summary: 提交扫描结果（当前仅报告）（operator 密钥）
+      description: >-
+        kind 取 [scan]，禁止机器提交人工验收。digest 必须与制品完全一致，
+        有效期必须晚于当前时间且不超过 7 天；来源与记录时间由服务器写入。
+        每次新报告会追加到扫描历史，完全相同的重试不会重复记录或延长有效期；
+        scan 返回最新记录，同时 metadata.scan_history 保留历史。
+        扫描缺失/过期不显示为通过，当前扫描报告不阻断发布。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerificationEvidence" }
+      responses:
+        "200":
+          description: 最新制品元数据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseMetadata" }
+        "400": { description: digest、类型、状态、有效期或报告 URL 非法 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /releases/{id}/promotion-targets:
+    get:
+      summary: 可晋级生产集群（enabled + production + manual + 有应用映射）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: 集群数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Cluster" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /releases/{id}/promote:
+    post:
+      summary: 晋级发布单到生产集群（operator 密钥）
+      description: >-
+        真实运行始终登记 pending 审批请求，需另一名人类 operator/admin 批准。
+        仅 MOCK_RUNTIME=true 且 PROMOTION_APPROVAL=false 时直接创建模拟任务。
+        必须已有同一 digest 的有效独立业务验证；审批绑定应用映射和生产基线。
+        已登记组件引用 ConfigMap/Secret 时，旧式无计划晋级入口会拒绝申请；请先在平台核对发布计划中的引用和配置恢复限制。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cluster_id]
+              properties:
+                cluster_id: { type: integer, minimum: 1 }
+      responses:
+        "202":
+          description: 审批请求已登记或生产发布已提交
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: integer, description: 审批模式返回 }
+                  release_id: { type: integer }
+                  prod_cluster_id: { type: integer, description: 审批模式返回 }
+                  prod_log_id: { type: integer, description: 直连模式返回 }
+                  status: { type: string, example: pending }
+        "400": { description: 测试未成功/目标不合法/存在外部配置引用但未通过发布计划确认 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: 已有 pending 审批请求或进行中的生产发布 }
+  /promotion-requests:
+    get:
+      summary: 晋级审批请求列表（新→旧）
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, approved, rejected, cancelled, expired] } }
+      responses:
+        "200":
+          description: 审批请求数组（过期 pending 会在读取时标记 expired）
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PromotionRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /promotion-requests/{id}/approve:
+    post:
+      summary: 兼容审批入口（机器身份禁止批准）
+      description: >-
+        API Key 无法作为独立审批人，此接口返回 403。请另一名人类 operator/admin
+        登录后通过 /api/v1/promotion-requests/{id}/approve 批准。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "400": { description: 请求非 pending 或已过期 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: 机器身份不能批准或发起人与审批人相同 }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /promotion-requests/{id}/reject:
+    post:
+      summary: 拒绝或撤销晋级请求（operator 密钥）
+      description: 发起人自己操作记录为 cancelled，其他操作人记录为 rejected。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: { type: string, maxLength: 255 }
+      responses:
+        "200":
+          description: 请求已关闭
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: { type: integer }
+                  status: { type: string, enum: [rejected, cancelled] }
+        "400": { description: 请求非 pending }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /deploy-logs/{id}:
+    get:
+      summary: 部署日志（含步骤明细）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: 部署日志，step_detail 为 JSON 字符串数组；每步含 step/success/stdout/stderr，可选 observation_status=verified|unknown 表示 Pod 运行时镜像摘要观察结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeployLog" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /deploy-logs/{id}/actions:
+    get:
+      summary: 发布任务的外部动作意图与回读记录
+      description: 只读动作日志；当前包含 Deployment 镜像写入。不确定结果会中断任务，不由此接口触发重放或恢复。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: 按动作创建顺序返回的动作日志数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DeliveryExecutionAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /rollback:
+    post:
+      summary: 受限历史镜像回退（operator 密钥）
+      description: 仅引用同集群成功部署的完整 digest；工作负载字段由服务端历史记录派生，配置、清单、数据库不恢复。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cluster_id, target_log_id]
+              properties:
+                cluster_id: { type: integer, minimum: 1 }
+                target_log_id: { type: integer, minimum: 1, description: 同集群成功且使用固化镜像的历史部署 ID }
+      responses:
+        "202":
+          description: 回滚任务已提交
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  log_id: { type: integer }
+                  status: { type: string, example: pending }
+                  message: { type: string }
+        "400": { description: 缺字段/字段非法 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: 集群或历史部署不存在 }
+        "409": { description: 同一工作负载已有活动任务 }
+  /runner/bindings/{id}/check:
+    post:
+      summary: Runner 接入检查（不创建发布任务）
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [pipeline_id]
+              properties:
+                pipeline_id: { type: string, pattern: '^[1-9][0-9]{0,19}$' }
+                image_full: { type: string, description: 可选候选镜像，只校验仓库 }
+      responses:
+        "200":
+          description: 授权、当前组件映射与流水线匹配；deploy_created 为 false
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  binding_id: { type: integer }
+                  app_name: { type: string }
+                  target_cluster: { type: string }
+                  deployment: { type: string }
+                  container: { type: string }
+                  image_repository: { type: string }
+                  deploy_created: { type: boolean, enum: [false] }
+        "400": { description: 非法请求、未知字段或错误镜像仓库 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: 流水线不匹配、组件映射变化或非生产自动策略不满足 }
+  /runner/bindings/{id}/events:
+    post:
+      summary: 上报绑定组件镜像（只允许非生产自动环境）
+      description: >-
+        目标由专属授权确定，不接受 app_name/target_cluster 等路由字段。
+        事件键由流水线、运行编号和绑定 ID 派生，重试保持相同产物。
+        较新构建已接收后拒绝旧构建；202 仅为受理，需查询发布结果。
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunnerImageEvent" }
+      responses:
+        "202":
+          description: 创建发布任务
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunnerAccepted" }
+        "200":
+          description: 同一次构建重试，返回已有任务
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunnerAccepted" }
+        "400": { description: 镜像仓库错误、缺失 digest、非法请求或未知字段 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: 流水线不匹配、组件映射变化或非生产自动策略不满足 }
+        "409": { description: 活动工作负载冲突、旧构建或同事件改写镜像 }
+  /runner/bindings/{id}/releases/{release_id}:
+    get:
+      summary: 查询本绑定的发布结果
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: release_id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: 发布执行状态（success 才表示 rollout 完成）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  release_id: { type: integer }
+                  status: { type: string, enum: [pending, running, success, failed, interrupted] }
+                  current_step: { type: string }
+                  error: { type: string }
+                  image: { type: string }
+                  finished_at: { type: string, format: date-time, nullable: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: 组件映射或环境策略变化 }
+        "404": { description: 发布不存在或不属于此绑定 }
+  /runner/bindings/{id}/releases/{release_id}/configuration:
+    post:
+      summary: 为本绑定制品固定配置仓库 revision
+      description: >-
+        供发布计划固定 Helm/Git 配置版本引用。生成的 Runner 脚本会在提交前核对工作区 Git origin、登记目录和 HEAD；此 API 本身只接受认证请求中的来源值，不会从平台端重新克隆仓库。仅允许本 Runner 绑定创建的制品；
+        repository_url 必须是不含凭据和查询参数的 HTTPS 仓库地址，revision 必须为完整 40 或 64 位 Git commit SHA。
+        相同来源可幂等重试；不同来源不能覆盖。checkout 元数据核对不证明 Helm 渲染、Kubernetes 应用结果，也不是可恢复的配置副本。
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: release_id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunnerConfigurationSourceSubmission" }
+      responses:
+        "201":
+          description: 首次固定配置来源
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConfigurationSourceRevision" }
+        "200": { description: 相同来源的幂等重试 }
+        "400": { description: 仓库 URL、目录或 Git revision 非法 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Runner 授权或组件绑定已失效 }
+        "404": { description: 发布不存在或不属于此绑定 }
+        "409": { description: 该制品已经固定了不同的配置来源 }
+  /runner/bindings/{id}/releases/{release_id}/verification:
+    post:
+      summary: 为本绑定的制品上报 CI / Smoke 证据
+      description: >-
+        仅允许本 Runner 绑定创建的非生产制品。digest 与提交身份由平台从制品和授权推导，
+        不接受客户端覆盖；CI / Smoke 必须精确配置为目标生产环境的可信来源。
+        Smoke 只能在对应测试环境 rollout 成功后提交。Runner 不能提交人工验收或触发审批/发布。
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: release_id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunnerVerificationSubmission" }
+      responses:
+        "200":
+          description: 更新后的制品验证元数据；相同请求重试不会重复记录或延长有效期
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseMetadata" }
+        "400": { description: 类型、状态、有效期、报告链接非法或 Smoke rollout 未成功 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Runner 授权或组件绑定已失效 }
+        "404": { description: 发布不存在或不属于此绑定 }
+  /runner/bindings/{id}/releases/{release_id}/scan:
+    post:
+      summary: 为本绑定的制品上报 CI 安全扫描（仅报告）
+      description: >-
+        仅允许本 Runner 绑定创建的非生产制品。digest、提交身份和记录时间由平台从制品与授权推导；
+        工具、工具版本、规则版本和报告链接随报告保存。扫描结果仅作报告，不阻断晋级或发布。
+      security: [{ RunnerToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: release_id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunnerScanSubmission" }
+      responses:
+        "200":
+          description: 更新后的扫描元数据；相同请求重试不会重复记录
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseMetadata" }
+        "400": { description: 扫描工具/版本、状态、有效期或报告链接非法 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Runner 授权或组件绑定已失效 }
+        "404": { description: 发布不存在或不属于此绑定 }
+components:
+  securitySchemes:
+    RunnerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: dpci_<token>
+      description: 绑定专属授权；只支持 Authorization Bearer，不允许访问通用 OpenAPI
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: dp_<token>
+      description: '也接受 `X-Api-Key: dp_<token>` 头'
+  responses:
+    Unauthorized:
+      description: 无效/禁用/过期密钥
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: 密钥角色不足（viewer 不可写）或绑定权限不满足
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    RunnerImageEvent:
+      type: object
+      additionalProperties: false
+      required: [pipeline_id, build_number, image_full, image_digest]
+      properties:
+        pipeline_id: { type: string, pattern: '^[1-9][0-9]{0,19}$' }
+        build_number: { type: string, pattern: '^[1-9][0-9]{0,19}$' }
+        image_full: { type: string, example: 'registry.example.com/orders/api:build-42' }
+        image_digest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        commit_id: { type: string }
+        commit_timestamp: { type: string, format: date-time, description: Git commit timestamp in RFC 3339; invalid/absent values stay unknown and never fall back to build time }
+    RunnerAccepted:
+      type: object
+      properties:
+        release_id: { type: integer }
+        test_log_id: { type: integer }
+        duplicate: { type: boolean }
+        status: { type: string, enum: [pending, running, success, failed, interrupted] }
+        result_url: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    ImageReleaseView:
+      type: object
+      properties:
+        id: { type: integer }
+        event_id: { type: string }
+        source: { type: string }
+        app_name: { type: string }
+        image_full: { type: string }
+        image_digest: { type: string, nullable: true, pattern: '^sha256:[0-9a-f]{64}$' }
+        metadata: { $ref: "#/components/schemas/ReleaseMetadata" }
+        deployments:
+          type: array
+          description: 所有目标与重试的独立部署历史，旧 prod 字段仅表示最近目标
+          items: { $ref: "#/components/schemas/DeployLog" }
+        promotion_blockers:
+          type: array
+          items: { type: string }
+        version: { type: string }
+        pipeline_id: { type: string }
+        pipeline_name: { type: string }
+        build_number: { type: string }
+        branch: { type: string }
+        commit_id: { type: string }
+        test_cluster_id: { type: integer }
+        test_deploy_log_id: { type: integer }
+        prod_cluster_id: { type: integer, nullable: true }
+        prod_deploy_log_id: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        test_cluster_name: { type: string }
+        test_status: { type: string, enum: [pending, running, success, failed, interrupted, ""] }
+        test_current_step: { type: string, nullable: true }
+        test_error: { type: string, nullable: true }
+        prod_status: { type: string, nullable: true }
+        prod_current_step: { type: string, nullable: true }
+        prod_error: { type: string, nullable: true }
+        can_promote: { type: boolean }
+    PromotionRequest:
+      type: object
+      properties:
+        id: { type: integer }
+        release_id: { type: integer }
+        delivery_plan_id: { type: integer, nullable: true, description: 已核对并关联的滚动发布计划 ID }
+        prod_cluster_id: { type: integer }
+        requester: { type: string }
+        template_hash: { type: string, description: 目标工作负载 UID 与非候选镜像配置的 SHA256 摘要 }
+        snapshot: { type: string, description: 绑定候选制品、证据、应用映射的 SHA256 指纹 }
+        expected_image: { type: string, description: 申请时观察的生产镜像 }
+        baseline_log_id: { type: integer, description: 申请时最新终态工作负载任务 ID }
+        status: { type: string, enum: [pending, approved, rejected, cancelled, expired] }
+        approver: { type: string, nullable: true }
+        comment: { type: string, nullable: true }
+        deploy_log_id: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        decided_at: { type: string, format: date-time, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+    Cluster:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        env_code: { type: string }
+        environment: { type: string }
+        environment_tier: { type: string, enum: [non_production, production] }
+        deploy_policy: { type: string, enum: [automatic, manual] }
+        connection_type: { type: string }
+        enabled: { type: boolean }
+        default_namespace: { type: string }
+        created_at: { type: string, format: date-time }
+    ComponentBinding:
+      type: object
+      description: 接收镜像事件时固定的组件与部署映射；固定部署配置仓库时，生成的 Runner 脚本会核对 Git checkout 身份，但不证明 Helm 渲染或 Kubernetes 应用结果
+      properties:
+        id: { type: integer }
+        cluster_id: { type: integer }
+        app_name: { type: string }
+        source_repo_url: { type: string }
+        source_path: { type: string }
+        deployment_config_repo_url: { type: string, description: 可选部署配置 Git 仓库；和代码仓库分开登记 }
+        deployment_config_path: { type: string, description: 配置仓库内相对目录，`.` 表示仓库根目录 }
+        image_repository: { type: string }
+        namespace: { type: string }
+        deployment_name: { type: string }
+        container_name: { type: string }
+        match_keyword: { type: string }
+        harbor_project: { type: string }
+        description: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    ReleaseMetadata:
+      type: object
+      properties:
+        binding: { $ref: "#/components/schemas/ComponentBinding" }
+        source_repositories:
+          type: array
+          description: 云效通知报告且与组件登记仓库核对后的代码源；这是构建声明，不是签名来源证明
+          items: { type: string, description: 归一化为 host/path，不含协议、凭据和 .git 后缀 }
+        source_path:
+          type: string
+          description: 本次构建报告的仓库内相对目录；组件绑定子目录时需与其完全匹配
+        commit_timestamp: { type: string, format: date-time, description: CI-reported Git commit time, normalized to UTC; optional telemetry }
+        configuration_source: { $ref: "#/components/schemas/ConfigurationSourceRevision" }
+        digest_source: { type: string, enum: [ci, registry, mock, ""] }
+        verification: { $ref: "#/components/schemas/VerificationEvidence" }
+        verification_history:
+          type: array
+          items: { $ref: "#/components/schemas/VerificationEvidence" }
+        scan: { $ref: "#/components/schemas/VerificationEvidence" }
+        scan_history:
+          type: array
+          items: { $ref: "#/components/schemas/VerificationEvidence" }
+    ConfigurationSourceRevision:
+      type: object
+      required: [repository_url, path, revision, recorded_by, recorded_at]
+      properties:
+        repository_url: { type: string, format: uri, description: 不含凭据、查询参数或片段的 HTTPS Git 仓库 }
+        path: { type: string, description: 仓库内相对目录，`.` 表示仓库根目录 }
+        revision: { type: string, pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$' }
+        recorded_by: { type: string, readOnly: true, description: 平台推导的 Runner 身份 }
+        recorded_at: { type: string, format: date-time, readOnly: true }
+    RunnerConfigurationSourceSubmission:
+      type: object
+      additionalProperties: false
+      required: [repository_url, revision]
+      properties:
+        repository_url: { type: string, format: uri, maxLength: 1024 }
+        path: { type: string, maxLength: 512, description: 可选仓库内相对目录，默认为 `.` }
+        revision: { type: string, pattern: '^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$' }
+    VerificationEvidence:
+      type: object
+      required: [digest, status, kind, valid_until]
+      properties:
+        digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        status: { type: string, enum: [passed, failed] }
+        kind: { type: string, enum: [ci, smoke, manual, scan] }
+        report_url: { type: string, maxLength: 2048, description: 可选 HTTP/HTTPS URL，不含用户信息 }
+        summary: { type: string, maxLength: 2000, description: 人工验收必须提供依据 }
+        tool: { type: string, maxLength: 128, description: 安全扫描工具 }
+        tool_version: { type: string, maxLength: 128, description: 扫描工具版本 }
+        rules_version: { type: string, maxLength: 128, description: 扫描规则或漏洞库版本 }
+        recorded_by: { type: string, readOnly: true }
+        recorded_at: { type: string, format: date-time, readOnly: true }
+        valid_until: { type: string, format: date-time }
+    RunnerVerificationSubmission:
+      type: object
+      additionalProperties: false
+      required: [kind, status, valid_until]
+      properties:
+        kind: { type: string, enum: [ci, smoke] }
+        status: { type: string, enum: [passed, failed] }
+        report_url: { type: string, format: uri, maxLength: 2048 }
+        summary: { type: string, maxLength: 2000 }
+        valid_until: { type: string, format: date-time, description: 未来时间且最多 7 天 }
+    RunnerScanSubmission:
+      type: object
+      additionalProperties: false
+      required: [status, tool, tool_version, rules_version, valid_until]
+      properties:
+        status: { type: string, enum: [passed, failed] }
+        tool: { type: string, minLength: 1, maxLength: 128 }
+        tool_version: { type: string, minLength: 1, maxLength: 128 }
+        rules_version: { type: string, minLength: 1, maxLength: 128 }
+        report_url: { type: string, format: uri, maxLength: 2048 }
+        summary: { type: string, maxLength: 2000 }
+        valid_until: { type: string, format: date-time, description: 未来时间且最多 7 天 }
+    DeployLog:
+      type: object
+      properties:
+        id: { type: integer }
+        release_id: { type: integer, description: 关联制品 ID，旧任务可能缺失 }
+        rollback_target_id: { type: integer, description: 镜像回退的历史部署 ID }
+        cluster_id: { type: integer }
+        app_name: { type: string }
+        deployment_name: { type: string }
+        container_name: { type: string }
+        namespace: { type: string }
+        version: { type: string }
+        image_full: { type: string, nullable: true }
+        deploy_type: { type: string, enum: [deploy, image_deploy, rollback] }
+        status: { type: string, enum: [pending, running, success, failed, interrupted] }
+        current_step: { type: string, nullable: true }
+        step_detail:
+          type: string
+          description: 'JSON 字符串数组；每步含 step/success/stdout/stderr，可选 observation_status=verified|unknown 表示 Pod 运行时镜像摘要观察结果'
+        error_message: { type: string, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        environment_tier_snapshot: { type: string, enum: [non_production, production], nullable: true, description: 创建任务时的环境等级快照；历史未知时省略 }
+        created_at: { type: string, format: date-time }
+    DeliveryExecutionAction:
+      type: object
+      properties:
+        id: { type: integer }
+        deploy_log_id: { type: integer }
+        action_key: { type: string, example: set-image }
+        action_kind: { type: string, example: set_deployment_image }
+        status: { type: string, enum: [intent, applied, not_applied, unknown] }
+        intent:
+          type: object
+          properties:
+            previous_image: { type: string }
+            target_image: { type: string }
+        observed:
+          type: object
+          nullable: true
+          properties:
+            current_image: { type: string }
+            readback: { type: string }
+        outcome_code: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }

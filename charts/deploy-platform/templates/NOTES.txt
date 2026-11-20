@@ -1,0 +1,15 @@
+Deploy Platform 已安装到 {{ .Release.Namespace }}。
+
+服务访问：
+{{- if .Values.ingress.enabled }}
+  Ingress: {{ range .Values.ingress.hosts }}{{ .host }}{{ end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "deploy-platform.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  → http://127.0.0.1:{{ .Values.service.port }}
+{{- end }}
+
+提醒：
+- 单副本约束：内存 Store + 任务队列未完成分布式改造，replicaCount 必须保持 1。
+- 平台 SA 权限分层：read（get/list/watch，默认绑定）/ write（update/patch/delete + pods/exec + secrets get，rbac.write=true 才绑定）。日志查看需要 pods/log（read 层已含）；exec 需要 pods/exec create（write 层）；Secret 显式查看需要 secrets get（write 层）。
+- 其他目标集群不经此 SA——由各自 kubeconfig/token 凭据 + impersonation 决定权限面。
+- 首次管理员：admin / ADMIN_INITIAL_PASSWORD 对应 Secret 值；空数据库首次启动必须配置，已有用户不会重置。真实运行缺少初始口令会拒绝创建默认管理员，mock 开发模式才保留 admin123 回退。

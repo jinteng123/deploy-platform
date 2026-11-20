@@ -1,0 +1,6 @@
+apiVersion: v2
+name: deploy-platform
+description: Deploy Platform — CD 发布平台 + Kuboard 风格 Kubernetes 控制台
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
